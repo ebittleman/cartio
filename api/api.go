@@ -22,8 +22,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
+	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/ebittleman/cartio/authn"
 	"github.com/ebittleman/cartio/authz"
 	"github.com/ebittleman/cartio/domain/cart"
@@ -39,22 +42,77 @@ const (
 	requestKey contextKey = "request"
 )
 
+// AuthParser parses a request and returns authn.Credential
+type AuthParser func(r *http.Request) (authn.Credential, error)
+
+// JWTParser parses a *http.Request for a JWT
+func JWTParser(r *http.Request) (authn.Credential, error) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return nil, http.ErrNotSupported
+	}
+
+	tokenStr, ok := parseBearerAuth(authHeader)
+	if !ok {
+		return nil, http.ErrNotSupported
+	}
+
+	return authn.NewJWTCredential(tokenStr)
+}
+
+// BasicParser parses a *http.Request for a Basic credentials
+func BasicParser(r *http.Request) (authn.Credential, error) {
+	user, password, ok := r.BasicAuth()
+	if !ok {
+		return nil, http.ErrNotSupported
+	}
+
+	return authn.NewPlainTextCredential(user, password), nil
+}
+
+// AuthPair pairs a auth.CredStore with a Parser that can extract credentials
+// from a *http.Request
+type AuthPair struct {
+	Store  authn.CredStore
+	Parser AuthParser
+}
+
 // AuthNegotiator returns an authn.Authenticator as per request parameters
 type AuthNegotiator func(r *http.Request) (authn.Authenticator, authn.Credential, error)
 
 // AuthenticatorNegotiationFactory parses a request to instantiate a
 // contextual authenticator populated with its required parameters
-func AuthenticatorNegotiationFactory(credStores []authn.CredStore) AuthNegotiator {
-	defaultStore := 0
-	return func(r *http.Request) (authn.Authenticator, authn.Credential, error) {
-		user, password, ok := r.BasicAuth()
+func AuthenticatorNegotiationFactory(authPairs map[string]AuthPair) AuthNegotiator {
+	return func(r *http.Request) (auth authn.Authenticator, cred authn.Credential, err error) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			return nil, nil, http.ErrNotSupported
+		}
+
+		authKey := strings.Split(authHeader, " ")[0]
+		pair, ok := authPairs[authKey]
 		if !ok {
 			return nil, nil, http.ErrNotSupported
 		}
 
-		authenticator := authn.NewAuthenticator(credStores[defaultStore])
-		return authenticator, authn.NewPlainTextCredential(user, password), nil
+		if cred, err = pair.Parser(r); err != nil {
+			return
+		}
+
+		auth = authn.NewAuthenticator(pair.Store)
+
+		return
 	}
+}
+
+func parseBearerAuth(auth string) (token string, ok bool) {
+	const prefix = "Bearer "
+
+	if !strings.HasPrefix(auth, prefix) {
+		return
+	}
+
+	return auth[len(prefix):], true
 }
 
 // AuthenticationRequired wraps http requests with authentication step
@@ -105,6 +163,42 @@ func HasPermission(rules authz.Rules, action string, subject string, next http.H
 	})
 }
 
+// JWTGenerator http handler that will generate JWT tokens
+type JWTGenerator struct {
+	method jwt.SigningMethod
+	secret []byte
+}
+
+// NewTokenHandler creates a new http handler that we swap creds for a token
+func NewTokenHandler(secret []byte, method jwt.SigningMethod) http.Handler {
+	return JWTGenerator{
+		method: method,
+		secret: secret,
+	}
+}
+
+func (j JWTGenerator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+
+	user, ok := r.Context().Value(userKey).(authn.UserID)
+	if user == nil || !ok {
+		http.Error(w, "Unauthorized - Login Required", http.StatusUnauthorized)
+		return
+	}
+
+	token := jwt.NewWithClaims(j.method, &jwt.StandardClaims{
+		Subject:   user.String(),
+		ExpiresAt: time.Now().Add(600 * time.Second).Unix(),
+	})
+
+	ss, err := token.SignedString(j.secret)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintln(w, ss)
+}
+
 // HelloWorld simple http handler for testing out auth stuff
 func HelloWorld(w http.ResponseWriter, r *http.Request) {
 	var place interface{} = "World"
@@ -124,6 +218,7 @@ type CommandHandler struct {
 	rules   authz.Rules
 }
 
+// NewCommandHandler creates a new http handler to serve cart api requests
 func NewCommandHandler() http.Handler {
 	service := cart.NewService(&MockProductService{}, &MockRepository{})
 	return &CommandHandler{
@@ -288,24 +383,27 @@ type Response struct {
 	SubmitOrder            *cart.SubmitOrderOutput            `json:"submit_order,omitempty"`
 }
 
+//
+// ================================================
+//
+//		MOCK AREA BELOW, Just Some Placeholders
+//      to get this thing running.
+//
+// ================================================
+//
+
+var carts = map[string]*cart.Cart{}
+
+// MockRepository fake cart repository
 type MockRepository struct {
-	carts map[string]*cart.Cart
-	sync.Mutex
+	sync.RWMutex
 }
 
-func (m *MockRepository) init() {
-	if m.carts != nil {
-		return
-	}
-
-	m.carts = make(map[string]*cart.Cart)
-}
-
+// GetCart gets cart from global fixture
 func (m *MockRepository) GetCart(cartID string) (*cart.Cart, error) {
-	m.Lock()
-	defer m.Unlock()
-	m.init()
-	cart, ok := m.carts[cartID]
+	m.RLock()
+	defer m.RUnlock()
+	cart, ok := carts[cartID]
 	if !ok {
 		return nil, nil
 	}
@@ -313,16 +411,18 @@ func (m *MockRepository) GetCart(cartID string) (*cart.Cart, error) {
 	return cart, nil
 }
 
+// SaveCart saves cart to global fixture
 func (m *MockRepository) SaveCart(cart cart.Cart) error {
 	m.Lock()
 	defer m.Unlock()
-	m.init()
-	m.carts[cart.ID] = &cart
+	carts[cart.ID] = &cart
 	return nil
 }
 
+// MockProductService fake product service
 type MockProductService struct{}
 
+// GetProduct returns fake product
 func (m *MockProductService) GetProduct(
 	ctx context.Context,
 	input *product.GetProductInput,

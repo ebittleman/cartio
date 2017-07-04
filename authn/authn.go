@@ -23,7 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+
+	jwt "github.com/dgrijalva/jwt-go"
 
 	"golang.org/x/crypto/scrypt"
 )
@@ -161,6 +162,90 @@ func (b PlainTextCredential) Check(other Credential) (bool, error) {
 	return true, nil
 }
 
+// JWTCredential javascript web token
+type JWTCredential struct {
+	tokenStr string
+
+	token  *jwt.Token
+	claims *jwt.StandardClaims
+}
+
+// NewJWTCredential creates a new JWTCredential
+func NewJWTCredential(tokenStr string) (Credential, error) {
+	return &JWTCredential{
+		tokenStr: tokenStr,
+	}, nil
+}
+
+func (j *JWTCredential) verify(secret []byte, method jwt.SigningMethod) (bool, error) {
+	claims := new(jwt.StandardClaims)
+
+	token, err := jwt.ParseWithClaims(j.tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+		// Don't forget to validate the alg is what you expect:
+		if token.Method != method {
+			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+		}
+
+		return secret, nil
+	})
+
+	if !token.Valid {
+		return false, err
+	}
+
+	j.token = token
+	j.claims = claims
+
+	return true, nil
+}
+
+// UserID returns the user id
+func (j *JWTCredential) UserID() UserID {
+	if j.claims == nil {
+		return nil
+	}
+
+	return userID(j.claims.Subject)
+}
+
+// Check cant really verify against itself, so this is not implemented
+func (j *JWTCredential) Check(other Credential) (bool, error) {
+	return false, errors.New("Not Implemented")
+}
+
+// jwtSecretCredential server side javascript web token
+type jwtSecretCredential struct {
+	method jwt.SigningMethod
+	secret []byte
+}
+
+// NewJWTCredStore instantiates a cred store for checking jwts
+func NewJWTCredStore(secret []byte, method jwt.SigningMethod) CredStore {
+	return jwtSecretCredential{
+		method: method,
+		secret: secret,
+	}
+}
+
+// UserID returns the user id
+func (j jwtSecretCredential) UserID() UserID {
+	return userID("")
+}
+
+// Check verifies a JWTCredential
+func (j jwtSecretCredential) Check(other Credential) (bool, error) {
+	otherCred, ok := other.(*JWTCredential)
+	if !ok {
+		return false, ErrInvalidCredential
+	}
+
+	return otherCred.verify(j.secret, j.method)
+}
+
+func (j jwtSecretCredential) RetrieveCredential(userID UserID) (Credential, error) {
+	return j, nil
+}
+
 type scryptHashedCredential struct {
 	user userID
 	hash string
@@ -200,9 +285,8 @@ const (
 
 func protect(password string) (string, error) {
 	salt := make([]byte, saltBytes)
-	_, err := io.ReadFull(rand.Reader, salt)
-	if err != nil {
-		log.Fatal(err)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return "", err
 	}
 
 	key, err := scrypt.Key(
@@ -216,6 +300,22 @@ func protect(password string) (string, error) {
 	}
 
 	return base64.StdEncoding.EncodeToString(append(key, salt...)), nil
+}
+
+// GenerateKey derives an encryption key/password hash from a password
+func GenerateKey(password string) ([]byte, error) {
+	salt := make([]byte, saltBytes)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return nil, err
+	}
+
+	key, err := scrypt.Key(
+		[]byte(password),
+		salt,
+		scryptN, scryptR, scryptP, keyBytes,
+	)
+
+	return key, err
 }
 
 func authenticate(password, hash string) (bool, error) {

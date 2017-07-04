@@ -20,36 +20,66 @@ import (
 	"log"
 	"net/http"
 
+	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/ebittleman/cartio/api"
 	"github.com/ebittleman/cartio/authn"
 	"github.com/ebittleman/cartio/authz"
 )
 
 func main() {
-	store := LocalUsers()
-	rules := LocalRules()
+	method := jwt.SigningMethodHS256
+	secret, err := authn.GenerateKey("supersecretpassword")
+	if err != nil {
+		panic(err)
+	}
+
+	authPairs := authPairs(secret, method)
+	rules := localRules()
+
+	authNegotiator := api.AuthenticatorNegotiationFactory(authPairs)
 
 	rootHandler := http.HandlerFunc(api.HelloWorld)
 
-	permHandler := api.HasPermission(rules, "makehello", "", rootHandler)
+	authorizedRootHandler := api.AuthenticationRequired(
+		authNegotiator,
+		api.HasPermission(rules, "makehello", "", rootHandler),
+	)
 
-	authHandler := api.AuthenticationRequired(
-		api.AuthenticatorNegotiationFactory([]authn.CredStore{store}),
-		permHandler,
+	tokenHandler := api.AuthenticationRequired(
+		authNegotiator,
+		api.NewTokenHandler(secret, method),
 	)
 
 	cmdHandler := api.AuthenticationRequired(
-		api.AuthenticatorNegotiationFactory([]authn.CredStore{store}),
+		authNegotiator,
 		api.NewCommandHandler(),
 	)
 
 	http.Handle("/", rootHandler)
-	http.Handle("/secure", authHandler)
+	http.Handle("/secure", authorizedRootHandler)
 	http.Handle("/command", cmdHandler)
+	http.Handle("/auth/token", tokenHandler)
 	log.Fatal(http.ListenAndServe("127.0.0.1:8080", nil))
 }
 
-func LocalUsers() authn.CredStore {
+func authPairs(secret []byte, method jwt.SigningMethod) map[string]api.AuthPair {
+	return map[string]api.AuthPair{
+		"Basic": {
+			Store:  localUsers(),
+			Parser: api.BasicParser,
+		},
+		"Bearer": {
+			Store:  jwtStore(secret, method),
+			Parser: api.JWTParser,
+		},
+	}
+}
+
+func jwtStore(secret []byte, method jwt.SigningMethod) authn.CredStore {
+	return authn.NewJWTCredStore(secret, method)
+}
+
+func localUsers() authn.CredStore {
 	store, err := authn.NewHashedMapStore(map[string]string{
 		"eric": "pass2",
 		"kate": "pass2",
@@ -61,7 +91,7 @@ func LocalUsers() authn.CredStore {
 	return store
 }
 
-func LocalRules() authz.Rules {
+func localRules() authz.Rules {
 	rules := authz.NewRules("eric")
 
 	rules.Allow("kate", "makehello", "")
