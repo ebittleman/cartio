@@ -22,8 +22,14 @@ func main() {
 		permHandler,
 	)
 
+	cmdHandler := api.AuthenticationRequired(
+		api.AuthenticatorNegotiationFactory([]authn.CredStore{store}),
+		api.NewCommandHandler(),
+	)
+
 	http.Handle("/", rootHandler)
 	http.Handle("/secure", authHandler)
+	http.Handle("/command", cmdHandler)
 	log.Fatal(http.ListenAndServe("127.0.0.1:8080", nil))
 }
 

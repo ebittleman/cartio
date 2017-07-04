@@ -3,17 +3,24 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 
 	"github.com/ebittleman/cartio/authn"
 	"github.com/ebittleman/cartio/authz"
+	"github.com/ebittleman/cartio/domain/cart"
+	"github.com/ebittleman/cartio/domain/cart/iface"
+	"github.com/ebittleman/cartio/domain/product"
+	"github.com/pborman/uuid"
 )
 
 type contextKey string
 
 const (
-	userKey contextKey = "user"
+	userKey    contextKey = "user"
+	requestKey contextKey = "request"
 )
 
 // AuthNegotiator returns an authn.Authenticator as per request parameters
@@ -97,51 +104,48 @@ func HelloWorld(w http.ResponseWriter, r *http.Request) {
 // CommandHandler recieves command requests and routes them to the proper
 // service
 type CommandHandler struct {
-	service CartService
+	service iface.CartService
+	rules   authz.Rules
+}
+
+func NewCommandHandler() http.Handler {
+	service := cart.NewService(&MockProductService{}, &MockRepository{})
+	return &CommandHandler{
+		service: service,
+		rules:   authz.NewRules("eric"),
+	}
 }
 
 func (c *CommandHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
+	defer r.Body.Close()
 
-	req := new(APIRequest)
+	req := new(Request)
 	err := decoder.Decode(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	resp := new(APIResponse)
+	if req.RequestID == "" {
+		req.RequestID = uuid.New()
+	}
+
+	resp := new(Response)
 	resp.Command = req.Command
 	resp.RequestID = req.RequestID
 
-	switch req.Command {
-	case "add_items":
-		resp.AddItems, err = c.service.AddItems(r.Context(), req.AddItems)
-	case "update_items":
-		resp.UpdateItems, err = c.service.UpdateItems(r.Context(), req.UpdateItems)
-	case "remove_items":
-		resp.RemoveItems, err = c.service.RemoveItems(r.Context(), req.RemoveItems)
-	case "add_coupon_code":
-		resp.AddCouponCode, err = c.service.AddCouponCode(r.Context(), req.AddCouponCode)
-	case "remove_coupon_code":
-		resp.RemoveCouponCode, err = c.service.RemoveCouponCode(r.Context(), req.RemoveCouponCode)
-	case "set_special_instructions":
-		resp.SetSpecialInstructions, err = c.service.SetSpecialInstructions(r.Context(), req.SetSpecialInstructions)
-	case "calculate_shipping":
-		resp.CalculateShipping, err = c.service.CalculateShipping(r.Context(), req.CalculateShipping)
-	case "calculate_sales_tax":
-		resp.CalculateSalesTax, err = c.service.CalculateSalesTax(r.Context(), req.CalculateSalesTax)
-	case "set_shipping_address":
-		resp.SetShippingAddress, err = c.service.SetShippingAddress(r.Context(), req.SetShippingAddress)
-	case "set_billing_address":
-		resp.SetBillingAddress, err = c.service.SetBillingAddress(r.Context(), req.SetBillingAddress)
-	case "set_payment_method":
-		resp.SetPaymentMethod, err = c.service.SetPaymentMethod(r.Context(), req.SetPaymentMethod)
-	case "submit_order":
-		resp.SubmitOrder, err = c.service.SubmitOrder(r.Context(), req.SubmitOrder)
+	ctx := context.WithValue(r.Context(), requestKey, req.RequestID)
+
+	if ok, err := c.isAllowed(ctx, req); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if !ok {
+		http.Error(w, "Unauthorized - Permission Denied", http.StatusUnauthorized)
+		return
 	}
 
-	if err != nil {
+	if err = c.execute(ctx, resp, req); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -154,203 +158,173 @@ func (c *CommandHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// APIRequest command endpoint request body
-type APIRequest struct {
+func (c *CommandHandler) isAllowed(
+	ctx context.Context,
+	req *Request,
+) (bool, error) {
+	var subject string
+	user := ctx.Value(userKey).(authn.UserID).String()
+
+	switch req.Command {
+	case "create_cart":
+	case "add_items":
+		subject = req.AddItems.CartID
+	case "update_items":
+		subject = req.UpdateItems.CartID
+	case "remove_items":
+		subject = req.RemoveItems.CartID
+	case "add_coupon_code":
+		subject = req.AddCouponCode.CartID
+	case "remove_coupon_code":
+		subject = req.RemoveCouponCode.CartID
+	case "set_special_instructions":
+		subject = req.SetSpecialInstructions.CartID
+	case "calculate_shipping":
+		subject = req.CalculateShipping.CartID
+	case "calculate_sales_tax":
+		subject = req.CalculateSalesTax.CartID
+	case "set_shipping_address":
+		subject = req.SetShippingAddress.CartID
+	case "set_billing_address":
+		subject = req.SetBillingAddress.CartID
+	case "set_payment_method":
+		subject = req.SetPaymentMethod.CartID
+	case "submit_order":
+		subject = req.SubmitOrder.CartID
+	}
+
+	return c.rules.IsAllowed(user, req.Command, subject), nil
+}
+
+func (c *CommandHandler) execute(ctx context.Context, resp *Response, req *Request) (err error) {
+	user := ctx.Value(userKey).(authn.UserID).String()
+
+	switch req.Command {
+	case "create_cart":
+		req.CreateCart.Owner = user
+		resp.CreateCart, err = c.service.CreateCart(ctx, req.CreateCart)
+	case "add_items":
+		resp.AddItems, err = c.service.AddItems(ctx, req.AddItems)
+	case "update_items":
+		resp.UpdateItems, err = c.service.UpdateItems(ctx, req.UpdateItems)
+	case "remove_items":
+		resp.RemoveItems, err = c.service.RemoveItems(ctx, req.RemoveItems)
+	case "add_coupon_code":
+		resp.AddCouponCode, err = c.service.AddCouponCode(ctx, req.AddCouponCode)
+	case "remove_coupon_code":
+		resp.RemoveCouponCode, err = c.service.RemoveCouponCode(ctx, req.RemoveCouponCode)
+	case "set_special_instructions":
+		resp.SetSpecialInstructions, err = c.service.SetSpecialInstructions(ctx, req.SetSpecialInstructions)
+	case "calculate_shipping":
+		resp.CalculateShipping, err = c.service.CalculateShipping(ctx, req.CalculateShipping)
+	case "calculate_sales_tax":
+		resp.CalculateSalesTax, err = c.service.CalculateSalesTax(ctx, req.CalculateSalesTax)
+	case "set_shipping_address":
+		resp.SetShippingAddress, err = c.service.SetShippingAddress(ctx, req.SetShippingAddress)
+	case "set_billing_address":
+		resp.SetBillingAddress, err = c.service.SetBillingAddress(ctx, req.SetBillingAddress)
+	case "set_payment_method":
+		resp.SetPaymentMethod, err = c.service.SetPaymentMethod(ctx, req.SetPaymentMethod)
+	case "submit_order":
+		resp.SubmitOrder, err = c.service.SubmitOrder(ctx, req.SubmitOrder)
+	}
+
+	return
+}
+
+// Request command endpoint request body
+type Request struct {
 	Command   string `json:"command"`
 	RequestID string `json:"request_id,omitempty"`
 
-	AddItems               *AddItemsInput               `json:"add_items,omitempty"`
-	UpdateItems            *UpdateItemsInput            `json:"update_items,omitempty"`
-	RemoveItems            *RemoveItemsInput            `json:"remove_items,omitempty"`
-	AddCouponCode          *AddCouponCodeInput          `json:"add_coupon_code,omitempty"`
-	RemoveCouponCode       *RemoveCouponCodeInput       `json:"remove_coupon_code,omitempty"`
-	SetSpecialInstructions *SetSpecialInstructionsInput `json:"set_special_instructions,omitempty"`
-	CalculateShipping      *CalculateShippingInput      `json:"calculate_shipping,omitempty"`
-	CalculateSalesTax      *CalculateSalesTaxInput      `json:"calculate_sales_tax,omitempty"`
-	SetShippingAddress     *SetShippingAddressInput     `json:"set_shipping_address,omitempty"`
-	SetBillingAddress      *SetBillingAddressInput      `json:"set_billing_address,omitempty"`
-	SetPaymentMethod       *SetPaymentMethodInput       `json:"set_payment_method,omitempty"`
-	SubmitOrder            *SubmitOrderInput            `json:"submit_order,omitempty"`
+	CreateCart             *cart.CreateCartInput             `json:"create_cart,omitempty"`
+	AddItems               *cart.AddItemsInput               `json:"add_items,omitempty"`
+	UpdateItems            *cart.UpdateItemsInput            `json:"update_items,omitempty"`
+	RemoveItems            *cart.RemoveItemsInput            `json:"remove_items,omitempty"`
+	AddCouponCode          *cart.AddCouponCodeInput          `json:"add_coupon_code,omitempty"`
+	RemoveCouponCode       *cart.RemoveCouponCodeInput       `json:"remove_coupon_code,omitempty"`
+	SetSpecialInstructions *cart.SetSpecialInstructionsInput `json:"set_special_instructions,omitempty"`
+	CalculateShipping      *cart.CalculateShippingInput      `json:"calculate_shipping,omitempty"`
+	CalculateSalesTax      *cart.CalculateSalesTaxInput      `json:"calculate_sales_tax,omitempty"`
+	SetShippingAddress     *cart.SetShippingAddressInput     `json:"set_shipping_address,omitempty"`
+	SetBillingAddress      *cart.SetBillingAddressInput      `json:"set_billing_address,omitempty"`
+	SetPaymentMethod       *cart.SetPaymentMethodInput       `json:"set_payment_method,omitempty"`
+	SubmitOrder            *cart.SubmitOrderInput            `json:"submit_order,omitempty"`
 }
 
-// APIResponse command endpoint response body
-type APIResponse struct {
+// Response command endpoint response body
+type Response struct {
 	Command   string `json:"command"`
 	RequestID string `json:"request_id,omitempty"`
 
-	AddItems               *AddItemsOutput               `json:"add_items,omitempty"`
-	UpdateItems            *UpdateItemsOutput            `json:"update_items,omitempty"`
-	RemoveItems            *RemoveItemsOutput            `json:"remove_items,omitempty"`
-	AddCouponCode          *AddCouponCodeOutput          `json:"add_coupon_code,omitempty"`
-	RemoveCouponCode       *RemoveCouponCodeOutput       `json:"remove_coupon_code,omitempty"`
-	SetSpecialInstructions *SetSpecialInstructionsOutput `json:"set_special_instructions,omitempty"`
-	CalculateShipping      *CalculateShippingOutput      `json:"calculate_shipping,omitempty"`
-	CalculateSalesTax      *CalculateSalesTaxOutput      `json:"calculate_sales_tax,omitempty"`
-	SetShippingAddress     *SetShippingAddressOutput     `json:"set_shipping_address,omitempty"`
-	SetBillingAddress      *SetBillingAddressOutput      `json:"set_billing_address,omitempty"`
-	SetPaymentMethod       *SetPaymentMethodOutput       `json:"set_payment_method,omitempty"`
-	SubmitOrder            *SubmitOrderOutput            `json:"submit_order,omitempty"`
+	CreateCart             *cart.CreateCartOutput             `json:"create_cart,omitempty"`
+	AddItems               *cart.AddItemsOutput               `json:"add_items,omitempty"`
+	UpdateItems            *cart.UpdateItemsOutput            `json:"update_items,omitempty"`
+	RemoveItems            *cart.RemoveItemsOutput            `json:"remove_items,omitempty"`
+	AddCouponCode          *cart.AddCouponCodeOutput          `json:"add_coupon_code,omitempty"`
+	RemoveCouponCode       *cart.RemoveCouponCodeOutput       `json:"remove_coupon_code,omitempty"`
+	SetSpecialInstructions *cart.SetSpecialInstructionsOutput `json:"set_special_instructions,omitempty"`
+	CalculateShipping      *cart.CalculateShippingOutput      `json:"calculate_shipping,omitempty"`
+	CalculateSalesTax      *cart.CalculateSalesTaxOutput      `json:"calculate_sales_tax,omitempty"`
+	SetShippingAddress     *cart.SetShippingAddressOutput     `json:"set_shipping_address,omitempty"`
+	SetBillingAddress      *cart.SetBillingAddressOutput      `json:"set_billing_address,omitempty"`
+	SetPaymentMethod       *cart.SetPaymentMethodOutput       `json:"set_payment_method,omitempty"`
+	SubmitOrder            *cart.SubmitOrderOutput            `json:"submit_order,omitempty"`
 }
 
-// CartService methods available for working with shopping carts
-type CartService interface {
-	AddItems(context.Context, *AddItemsInput) (*AddItemsOutput, error)
-	UpdateItems(context.Context, *UpdateItemsInput) (*UpdateItemsOutput, error)
-	RemoveItems(context.Context, *RemoveItemsInput) (*RemoveItemsOutput, error)
-	AddCouponCode(context.Context, *AddCouponCodeInput) (*AddCouponCodeOutput, error)
-	RemoveCouponCode(context.Context, *RemoveCouponCodeInput) (*RemoveCouponCodeOutput, error)
-	SetSpecialInstructions(context.Context, *SetSpecialInstructionsInput) (*SetSpecialInstructionsOutput, error)
-	CalculateShipping(context.Context, *CalculateShippingInput) (*CalculateShippingOutput, error)
-	CalculateSalesTax(context.Context, *CalculateSalesTaxInput) (*CalculateSalesTaxOutput, error)
-	SetShippingAddress(context.Context, *SetShippingAddressInput) (*SetShippingAddressOutput, error)
-	SetBillingAddress(context.Context, *SetBillingAddressInput) (*SetBillingAddressOutput, error)
-	SetPaymentMethod(context.Context, *SetPaymentMethodInput) (*SetPaymentMethodOutput, error)
-	SubmitOrder(context.Context, *SubmitOrderInput) (*SubmitOrderOutput, error)
+type MockRepository struct {
+	carts map[string]*cart.Cart
+	sync.Mutex
 }
 
-type AddItem struct {
-	ID  string `json:"id"`
-	Qty int    `json:"qty"`
+func (m *MockRepository) init() {
+	if m.carts != nil {
+		return
+	}
+
+	m.carts = make(map[string]*cart.Cart)
 }
 
-type AddItemsInput struct {
-	CartID string    `json:"cart_id"`
-	Items  []AddItem `json:"items"`
+func (m *MockRepository) GetCart(cartID string) (*cart.Cart, error) {
+	m.Lock()
+	defer m.Unlock()
+	m.init()
+	cart, ok := m.carts[cartID]
+	if !ok {
+		return nil, nil
+	}
+
+	return cart, nil
 }
 
-type AddItemsOutput struct {
-	CartID string `json:"cart_id"`
+func (m *MockRepository) SaveCart(cart cart.Cart) error {
+	m.Lock()
+	defer m.Unlock()
+	m.init()
+	m.carts[cart.ID] = &cart
+	return nil
 }
 
-type UpdateItem struct {
-	ID  string `json:"id"`
-	Qty int    `json:"qty"`
+type MockProductService struct{}
+
+func (m *MockProductService) GetProduct(
+	ctx context.Context,
+	input *product.GetProductInput,
+) (*product.GetProductOutput, error) {
+	output, ok := products[input.ProductID]
+	if !ok {
+		return nil, errors.New("Product Not Found: " + input.ProductID)
+	}
+
+	return output, nil
 }
 
-type UpdateItemsInput struct {
-	CartID string       `json:"cart_id"`
-	Items  []UpdateItem `json:"items"`
-}
-
-type UpdateItemsOutput struct {
-	CartID string `json:"cart_id"`
-}
-
-type RemoveItem struct {
-	ID string `json:"id"`
-}
-
-type RemoveItemsInput struct {
-	CartID string       `json:"cart_id"`
-	Items  []RemoveItem `json:"items"`
-}
-
-type RemoveItemsOutput struct {
-	CartID string `json:"cart_id"`
-}
-
-type AddCouponCodeInput struct {
-	CartID string `json:"cart_id"`
-	Code   string `json:"code"`
-}
-
-type AddCouponCodeOutput struct {
-	CartID string `json:"cart_id"`
-}
-
-type RemoveCouponCodeInput struct {
-	CartID string `json:"cart_id"`
-	Code   string `json:"code"`
-}
-
-type RemoveCouponCodeOutput struct {
-	CartID string `json:"cart_id"`
-}
-
-type SetSpecialInstructionsInput struct {
-	CartID       string `json:"cart_id"`
-	Instructions string `json:"instructions"`
-}
-
-type SetSpecialInstructionsOutput struct {
-	CartID string `json:"cart_id"`
-}
-
-type CalculateShippingInput struct {
-	CartID      string `json:"cart_id"`
-	PostalCode  string `json:"postal_code"`
-	CountryCode string `json:"country_code"`
-}
-
-type CalculateShippingOutput struct {
-	CartID string `json:"cart_id"`
-}
-
-type CalculateSalesTaxInput struct {
-	CartID      string `json:"cart_id"`
-	PostalCode  string `json:"postal_code"`
-	CountryCode string `json:"country_code"`
-}
-
-type CalculateSalesTaxOutput struct {
-	CartID string `json:"cart_id"`
-}
-
-type SetShippingAddressInput struct {
-	CartID      string `json:"cart_id"`
-	ShipTo      string `json:"ship_to"`
-	Addr1       string `json:"addr_1"`
-	Addr2       string `json:"addr_2"`
-	AptSuite    string `json:"apt_suite"`
-	City        string `json:"city"`
-	PostalCode  string `json:"postal_code"`
-	CountryCode string `json:"country_code"`
-}
-
-type SetShippingAddressOutput struct {
-	CartID string `json:"cart_id"`
-}
-
-type SetBillingAddressInput struct {
-	CartID      string `json:"cart_id"`
-	BillTo      string `json:"bill_to"`
-	Addr1       string `json:"addr_1"`
-	Addr2       string `json:"addr_2"`
-	AptSuite    string `json:"apt_suite"`
-	City        string `json:"city"`
-	PostalCode  string `json:"postal_code"`
-	CountryCode string `json:"country_code"`
-}
-
-type SetBillingAddressOutput struct {
-	CartID string `json:"cart_id"`
-}
-
-type PayPal struct{}
-type Stripe struct{}
-type AccountBalance struct {
-	RemainderWith string `json:"remainder_with"`
-	PayPal        PayPal `json:"paypal"`
-	Stripe        Stripe `json:"stripe"`
-}
-
-type SetPaymentMethodInput struct {
-	CartID         string         `json:"cart_id"`
-	Type           string         `json:"type"`
-	PayPal         PayPal         `json:"paypal"`
-	Stripe         Stripe         `json:"stripe"`
-	AccountBalance AccountBalance `json:"account_balance"`
-}
-
-type SetPaymentMethodOutput struct {
-	CartID string `json:"cart_id"`
-}
-
-type SubmitOrderInput struct {
-	CartID       string `json:"cart_id"`
-	AgreeToTerms bool   `json:"agree_to_terms"`
-}
-
-type SubmitOrderOutput struct {
-	CartID string `json:"cart_id"`
+var products = map[string]*product.GetProductOutput{
+	"prod1": &product.GetProductOutput{
+		Product: product.Product{
+			ID:    "prod1",
+			Name:  "Test Item",
+			Price: 100,
+		},
+	},
 }
