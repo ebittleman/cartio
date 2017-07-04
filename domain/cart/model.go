@@ -49,8 +49,8 @@ type CartItem struct {
 }
 
 type Cart struct {
-	ID    string
-	Owner string
+	id    string
+	owner string
 
 	ShipTo        Address
 	BillTo        Address
@@ -67,6 +67,21 @@ type Cart struct {
 	SalesTax int
 	Shipping int
 	Total    int
+}
+
+func NewCart(id string, owner string) Cart {
+	return Cart{
+		id:    id,
+		owner: owner,
+	}
+}
+
+func (c Cart) ID() string {
+	return c.id
+}
+
+func (c Cart) Owner() string {
+	return c.owner
 }
 
 func (c Cart) Calculate() Cart {

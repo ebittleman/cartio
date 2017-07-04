@@ -42,7 +42,7 @@ func main() {
 
 	authorizedRootHandler := api.AuthenticationRequired(
 		authNegotiator,
-		api.HasPermission(rules, "makehello", "", rootHandler),
+		api.HasPermission(rules, "makehello", nil, rootHandler),
 	)
 
 	tokenHandler := api.AuthenticationRequired(
@@ -52,7 +52,7 @@ func main() {
 
 	cmdHandler := api.AuthenticationRequired(
 		authNegotiator,
-		api.NewCommandHandler(),
+		api.NewCommandHandler(rules),
 	)
 
 	http.Handle("/", rootHandler)
@@ -92,9 +92,11 @@ func localUsers() authn.CredStore {
 }
 
 func localRules() authz.Rules {
-	rules := authz.NewRules("eric")
+	rules := authz.NewRules("root")
 
-	rules.Allow("kate", "makehello", "")
+	rules.Allow("eric", "makehello", nil)
+	rules.Allow("eric", "create_cart", nil)
+	rules.Allow("kate", "makehello", nil)
 
 	return rules
 }

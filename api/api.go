@@ -22,11 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
-	"time"
 
-	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/ebittleman/cartio/authn"
 	"github.com/ebittleman/cartio/authz"
 	"github.com/ebittleman/cartio/domain/cart"
@@ -41,163 +38,6 @@ const (
 	userKey    contextKey = "user"
 	requestKey contextKey = "request"
 )
-
-// AuthParser parses a request and returns authn.Credential
-type AuthParser func(r *http.Request) (authn.Credential, error)
-
-// JWTParser parses a *http.Request for a JWT
-func JWTParser(r *http.Request) (authn.Credential, error) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		return nil, http.ErrNotSupported
-	}
-
-	tokenStr, ok := parseBearerAuth(authHeader)
-	if !ok {
-		return nil, http.ErrNotSupported
-	}
-
-	return authn.NewJWTCredential(tokenStr)
-}
-
-// BasicParser parses a *http.Request for a Basic credentials
-func BasicParser(r *http.Request) (authn.Credential, error) {
-	user, password, ok := r.BasicAuth()
-	if !ok {
-		return nil, http.ErrNotSupported
-	}
-
-	return authn.NewPlainTextCredential(user, password), nil
-}
-
-// AuthPair pairs a auth.CredStore with a Parser that can extract credentials
-// from a *http.Request
-type AuthPair struct {
-	Store  authn.CredStore
-	Parser AuthParser
-}
-
-// AuthNegotiator returns an authn.Authenticator as per request parameters
-type AuthNegotiator func(r *http.Request) (authn.Authenticator, authn.Credential, error)
-
-// AuthenticatorNegotiationFactory parses a request to instantiate a
-// contextual authenticator populated with its required parameters
-func AuthenticatorNegotiationFactory(authPairs map[string]AuthPair) AuthNegotiator {
-	return func(r *http.Request) (auth authn.Authenticator, cred authn.Credential, err error) {
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			return nil, nil, http.ErrNotSupported
-		}
-
-		authKey := strings.Split(authHeader, " ")[0]
-		pair, ok := authPairs[authKey]
-		if !ok {
-			return nil, nil, http.ErrNotSupported
-		}
-
-		if cred, err = pair.Parser(r); err != nil {
-			return
-		}
-
-		auth = authn.NewAuthenticator(pair.Store)
-
-		return
-	}
-}
-
-func parseBearerAuth(auth string) (token string, ok bool) {
-	const prefix = "Bearer "
-
-	if !strings.HasPrefix(auth, prefix) {
-		return
-	}
-
-	return auth[len(prefix):], true
-}
-
-// AuthenticationRequired wraps http requests with authentication step
-func AuthenticationRequired(authNegotiator AuthNegotiator, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authenticator, credential, err := authNegotiator(r)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		ok, err := authenticator.Authenticate(credential)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		if !ok {
-			http.Error(w, "Unauthorized - Authentication Failed", http.StatusUnauthorized)
-			return
-		}
-
-		newR := r.WithContext(context.WithValue(
-			r.Context(),
-			userKey,
-			credential.UserID(),
-		))
-
-		next.ServeHTTP(w, newR)
-	})
-}
-
-// HasPermission protects an endpoint with some basic rbac
-func HasPermission(rules authz.Rules, action string, subject string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user, ok := r.Context().Value(userKey).(authn.UserID)
-		if !ok || user == nil {
-			http.Error(w, "Unauthorized - Login Required", http.StatusUnauthorized)
-			return
-		}
-
-		if !rules.IsAllowed(user.String(), action, subject) {
-			http.Error(w, "Unauthorized - Permission Denied", http.StatusUnauthorized)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-// JWTGenerator http handler that will generate JWT tokens
-type JWTGenerator struct {
-	method jwt.SigningMethod
-	secret []byte
-}
-
-// NewTokenHandler creates a new http handler that we swap creds for a token
-func NewTokenHandler(secret []byte, method jwt.SigningMethod) http.Handler {
-	return JWTGenerator{
-		method: method,
-		secret: secret,
-	}
-}
-
-func (j JWTGenerator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
-	user, ok := r.Context().Value(userKey).(authn.UserID)
-	if user == nil || !ok {
-		http.Error(w, "Unauthorized - Login Required", http.StatusUnauthorized)
-		return
-	}
-
-	token := jwt.NewWithClaims(j.method, &jwt.StandardClaims{
-		Subject:   user.String(),
-		ExpiresAt: time.Now().Add(600 * time.Second).Unix(),
-	})
-
-	ss, err := token.SignedString(j.secret)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	fmt.Fprintln(w, ss)
-}
 
 // HelloWorld simple http handler for testing out auth stuff
 func HelloWorld(w http.ResponseWriter, r *http.Request) {
@@ -219,11 +59,11 @@ type CommandHandler struct {
 }
 
 // NewCommandHandler creates a new http handler to serve cart api requests
-func NewCommandHandler() http.Handler {
+func NewCommandHandler(rules authz.Rules) http.Handler {
 	service := cart.NewService(&MockProductService{}, &MockRepository{})
 	return &CommandHandler{
 		service: service,
-		rules:   authz.NewRules("eric"),
+		rules:   rules,
 	}
 }
 
@@ -248,7 +88,17 @@ func (c *CommandHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ctx := context.WithValue(r.Context(), requestKey, req.RequestID)
 
-	if ok, err := c.isAllowed(ctx, req); err != nil {
+	subject, err := c.resolveSubject(ctx, req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if subject != nil {
+		ctx = context.WithValue(r.Context(), cart.CartKey, subject)
+	}
+
+	if ok, err := c.isAllowed(ctx, req.Command); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	} else if !ok {
@@ -269,51 +119,80 @@ func (c *CommandHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (c *CommandHandler) isAllowed(
+func (c *CommandHandler) resolveSubject(
 	ctx context.Context,
 	req *Request,
-) (bool, error) {
-	var subject string
-	user := ctx.Value(userKey).(authn.UserID).String()
+) (subject authz.Subject, err error) {
+	var subjectID string
 
 	switch req.Command {
 	case "create_cart":
 	case "add_items":
-		subject = req.AddItems.CartID
+		subjectID = req.AddItems.CartID
 	case "update_items":
-		subject = req.UpdateItems.CartID
+		subjectID = req.UpdateItems.CartID
 	case "remove_items":
-		subject = req.RemoveItems.CartID
+		subjectID = req.RemoveItems.CartID
 	case "add_coupon_code":
-		subject = req.AddCouponCode.CartID
+		subjectID = req.AddCouponCode.CartID
 	case "remove_coupon_code":
-		subject = req.RemoveCouponCode.CartID
+		subjectID = req.RemoveCouponCode.CartID
 	case "set_special_instructions":
-		subject = req.SetSpecialInstructions.CartID
+		subjectID = req.SetSpecialInstructions.CartID
 	case "calculate_shipping":
-		subject = req.CalculateShipping.CartID
+		subjectID = req.CalculateShipping.CartID
 	case "calculate_sales_tax":
-		subject = req.CalculateSalesTax.CartID
+		subjectID = req.CalculateSalesTax.CartID
 	case "set_shipping_address":
-		subject = req.SetShippingAddress.CartID
+		subjectID = req.SetShippingAddress.CartID
 	case "set_billing_address":
-		subject = req.SetBillingAddress.CartID
+		subjectID = req.SetBillingAddress.CartID
 	case "set_payment_method":
-		subject = req.SetPaymentMethod.CartID
+		subjectID = req.SetPaymentMethod.CartID
 	case "submit_order":
-		subject = req.SubmitOrder.CartID
+		subjectID = req.SubmitOrder.CartID
 	}
 
-	return c.rules.IsAllowed(user, req.Command, subject), nil
+	if subjectID == "" {
+		return
+	}
+
+	output, err := c.service.GetCart(ctx, &cart.GetCartInput{
+		ID: subjectID,
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return *output.Cart, nil
+
 }
 
-func (c *CommandHandler) execute(ctx context.Context, resp *Response, req *Request) (err error) {
+func (c *CommandHandler) isAllowed(
+	ctx context.Context,
+	action string,
+) (bool, error) {
+	var subject authz.Subject
+	user := ctx.Value(userKey).(authn.UserID).String()
+	if cart, ok := ctx.Value(cart.CartKey).(authz.Subject); ok {
+		subject = cart
+	}
+
+	return c.rules.IsAllowed(user, action, subject), nil
+}
+
+func (c *CommandHandler) execute(
+	ctx context.Context,
+	resp *Response,
+	req *Request,
+) (err error) {
 	user := ctx.Value(userKey).(authn.UserID).String()
 
 	switch req.Command {
 	case "create_cart":
-		req.CreateCart.Owner = user
-		resp.CreateCart, err = c.service.CreateCart(ctx, req.CreateCart)
+		input := &cart.CreateCartInput{Owner: user}
+		resp.CreateCart, err = c.service.CreateCart(ctx, input)
 	case "add_items":
 		resp.AddItems, err = c.service.AddItems(ctx, req.AddItems)
 	case "update_items":
@@ -348,7 +227,7 @@ type Request struct {
 	Command   string `json:"command"`
 	RequestID string `json:"request_id,omitempty"`
 
-	CreateCart             *cart.CreateCartInput             `json:"create_cart,omitempty"`
+	// CreateCart             *cart.CreateCartInput             `json:"create_cart,omitempty"`
 	AddItems               *cart.AddItemsInput               `json:"add_items,omitempty"`
 	UpdateItems            *cart.UpdateItemsInput            `json:"update_items,omitempty"`
 	RemoveItems            *cart.RemoveItemsInput            `json:"remove_items,omitempty"`
@@ -415,7 +294,7 @@ func (m *MockRepository) GetCart(cartID string) (*cart.Cart, error) {
 func (m *MockRepository) SaveCart(cart cart.Cart) error {
 	m.Lock()
 	defer m.Unlock()
-	carts[cart.ID] = &cart
+	carts[cart.ID()] = &cart
 	return nil
 }
 

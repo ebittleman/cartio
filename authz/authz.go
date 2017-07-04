@@ -33,6 +33,11 @@ type Rules struct {
 	allowed   map[string]struct{}
 }
 
+type Subject interface {
+	ID() string
+	Owner() string
+}
+
 func NewRules(superUser string) Rules {
 	return Rules{
 		superUser: superUser,
@@ -41,22 +46,40 @@ func NewRules(superUser string) Rules {
 	}
 }
 
-func (r *Rules) Allow(principal string, action string, subject string) {
-	address := formatRule(principal, action, subject)
+func (r *Rules) Allow(principal string, action string, subject Subject) {
+	var subjectID string
+	if subject != nil {
+		subjectID = subject.ID()
+	}
+	address := formatRule(principal, action, subjectID)
 	r.allowed[address] = struct{}{}
 }
 
-func (r *Rules) Deny(principal string, action string, subject string) {
-	address := formatRule(principal, action, subject)
+func (r *Rules) Deny(principal string, action string, subject Subject) {
+	var subjectID string
+	if subject != nil {
+		subjectID = subject.ID()
+	}
+	address := formatRule(principal, action, subjectID)
 	r.denied[address] = struct{}{}
 }
 
-func (r Rules) IsAllowed(principal string, action string, subject string) bool {
+func (r Rules) IsAllowed(principal string, action string, subject Subject) bool {
+	var subjectID string
+
+	if subject != nil {
+		if principal == subject.Owner() {
+			return true
+		}
+
+		subjectID = subject.ID()
+	}
+
 	if r.superUser == principal {
 		return true
 	}
 
-	address := formatRule(principal, action, subject)
+	address := formatRule(principal, action, subjectID)
 	if _, notOK := r.denied[address]; notOK {
 		return false
 	}

@@ -24,6 +24,8 @@ import (
 
 // CartService methods available for working with shopping carts
 type CartService interface {
+	GetCart(context.Context, *cart.GetCartInput) (*cart.GetCartOutput, error)
+
 	CreateCart(context.Context, *cart.CreateCartInput) (*cart.CreateCartOutput, error)
 	AddItems(context.Context, *cart.AddItemsInput) (*cart.AddItemsOutput, error)
 	UpdateItems(context.Context, *cart.UpdateItemsInput) (*cart.UpdateItemsOutput, error)

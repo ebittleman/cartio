@@ -25,6 +25,13 @@ import (
 	"github.com/pborman/uuid"
 )
 
+type contextKey string
+
+const (
+	// CartKey context key for current cart being operated on
+	CartKey contextKey = "cart"
+)
+
 type Service struct {
 	productService iface.ProductService
 	repo           Repository
@@ -40,6 +47,52 @@ func NewService(
 	}
 }
 
+func (c *Service) resolveCart(
+	ctx context.Context,
+	id string,
+) (cart Cart, err error) {
+	var foundCart *Cart
+
+	if subject, ok := ctx.Value(CartKey).(Cart); ok {
+		cart = subject
+	} else {
+		foundCart, err = c.repo.GetCart(id)
+		if err != nil {
+			return
+		}
+
+		if foundCart == nil {
+			err = errors.New("Cart Not Found: " + id)
+			return
+		}
+
+		cart = *foundCart
+	}
+
+	return
+}
+
+type GetCartInput struct {
+	ID string
+}
+
+type GetCartOutput struct {
+	Cart *Cart
+}
+
+func (c *Service) GetCart(ctx context.Context, input *GetCartInput) (*GetCartOutput, error) {
+	cart, err := c.repo.GetCart(input.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	if cart == nil {
+		return nil, errors.New("Cart Not Found")
+	}
+
+	return &GetCartOutput{Cart: cart}, nil
+}
+
 type CreateCartInput struct {
 	Owner string `json:"owner"`
 }
@@ -52,13 +105,11 @@ func (c *Service) CreateCart(
 	ctx context.Context,
 	input *CreateCartInput,
 ) (output *CreateCartOutput, err error) {
-	var cart Cart
-	cart.Owner = input.Owner
-
+	var id string
 	for {
-		cart.ID = uuid.New()
+		id = uuid.New()
 
-		exists, err := c.repo.GetCart(cart.ID)
+		exists, err := c.repo.GetCart(id)
 		if err != nil {
 			return nil, err
 		}
@@ -68,12 +119,14 @@ func (c *Service) CreateCart(
 		}
 	}
 
+	cart := NewCart(id, input.Owner)
+
 	if err = c.repo.SaveCart(cart); err != nil {
 		return
 	}
 
 	output = new(CreateCartOutput)
-	output.CartID = cart.ID
+	output.CartID = cart.ID()
 
 	return
 }
@@ -96,18 +149,11 @@ func (c *Service) AddItems(
 	ctx context.Context,
 	input *AddItemsInput,
 ) (output *AddItemsOutput, err error) {
-	var foundCart *Cart
-
-	foundCart, err = c.repo.GetCart(input.CartID)
-	if err != nil {
-		return
+	var cart Cart
+	if cart, err = c.resolveCart(ctx, input.CartID); err != nil {
+		return nil, err
 	}
 
-	if foundCart == nil {
-		return nil, errors.New("Cart Not Found: " + input.CartID)
-	}
-
-	cart := *foundCart
 	for _, addItem := range input.Items {
 		productOutput, err := c.productService.GetProduct(
 			ctx,
@@ -133,7 +179,7 @@ func (c *Service) AddItems(
 	}
 
 	output = new(AddItemsOutput)
-	output.CartID = cart.ID
+	output.CartID = cart.ID()
 
 	return output, nil
 }
