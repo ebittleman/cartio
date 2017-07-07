@@ -16,7 +16,10 @@
 
 package cart
 
+import "context"
+
 type Repository interface {
-	GetCart(cartID string) (*Cart, error)
-	SaveCart(cart Cart) error
+	NewCart(owner string) (Cart, error)
+	GetCart(cartID string) (Cart, error)
+	SaveCart(ctx context.Context, cart Cart) error
 }

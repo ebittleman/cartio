@@ -21,23 +21,27 @@ import (
 	"net/url"
 )
 
+// Rule describes if a user can or cannot do an action on a subject
 type Rule struct {
 	Principal string
 	Action    string
 	Subject   string
 }
 
+// Rules basic rule set for determining access rights
 type Rules struct {
 	superUser string
 	denied    map[string]struct{}
 	allowed   map[string]struct{}
 }
 
+// Subject a resouce that can be procted by system rules
 type Subject interface {
 	ID() string
 	Owner() string
 }
 
+// NewRules instantiates a new Rules struct
 func NewRules(superUser string) Rules {
 	return Rules{
 		superUser: superUser,
@@ -46,6 +50,7 @@ func NewRules(superUser string) Rules {
 	}
 }
 
+// Allow adds a rule to allow a user to act on a subject
 func (r *Rules) Allow(principal string, action string, subject Subject) {
 	var subjectID string
 	if subject != nil {
@@ -55,6 +60,7 @@ func (r *Rules) Allow(principal string, action string, subject Subject) {
 	r.allowed[address] = struct{}{}
 }
 
+// Allow adds a rule to denay a user to act on a subject
 func (r *Rules) Deny(principal string, action string, subject Subject) {
 	var subjectID string
 	if subject != nil {
@@ -64,6 +70,9 @@ func (r *Rules) Deny(principal string, action string, subject Subject) {
 	r.denied[address] = struct{}{}
 }
 
+// IsAllowed checks to see if a user is allowed to act on the subject as per
+// the defined rules. If the user owns the subject or is the super user of the
+// system, rules are not checked and the user is allowed to act on the subject.
 func (r Rules) IsAllowed(principal string, action string, subject Subject) bool {
 	var subjectID string
 

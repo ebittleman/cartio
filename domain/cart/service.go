@@ -18,11 +18,9 @@ package cart
 
 import (
 	"context"
-	"errors"
 
 	"github.com/ebittleman/cartio/domain/product"
 	"github.com/ebittleman/cartio/domain/product/iface"
-	"github.com/pborman/uuid"
 )
 
 type contextKey string
@@ -32,11 +30,13 @@ const (
 	CartKey contextKey = "cart"
 )
 
+// Service implements CartService
 type Service struct {
 	productService iface.ProductService
 	repo           Repository
 }
 
+// NewService instantiates a new local CartService
 func NewService(
 	productService iface.ProductService,
 	repo Repository,
@@ -51,78 +51,62 @@ func (c *Service) resolveCart(
 	ctx context.Context,
 	id string,
 ) (cart Cart, err error) {
-	var foundCart *Cart
 
 	if subject, ok := ctx.Value(CartKey).(Cart); ok {
 		cart = subject
 	} else {
-		foundCart, err = c.repo.GetCart(id)
-		if err != nil {
-			return
-		}
-
-		if foundCart == nil {
-			err = errors.New("Cart Not Found: " + id)
-			return
-		}
-
-		cart = *foundCart
+		cart, err = c.repo.GetCart(id)
 	}
 
 	return
 }
 
+// GetCartInput parameters for calling GetCart
 type GetCartInput struct {
 	ID string
 }
 
+// GetCartOutput response data from calling GetCart
 type GetCartOutput struct {
-	Cart *Cart
+	Cart Cart
 }
 
+// GetCart retreives a Cart from the repository
 func (c *Service) GetCart(ctx context.Context, input *GetCartInput) (*GetCartOutput, error) {
 	cart, err := c.repo.GetCart(input.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	if cart == nil {
-		return nil, errors.New("Cart Not Found")
+	if cart == nil || cart.ID() == "" {
+		return nil, ErrCartNotFound
 	}
 
 	return &GetCartOutput{Cart: cart}, nil
 }
 
+// CreateCartInput parameters for calling CreateCart
 type CreateCartInput struct {
 	Owner string `json:"owner"`
 }
 
+// CreateCartOutput response data from calling CreateCart
 type CreateCartOutput struct {
 	CartID string `json:"cart_id"`
 }
 
+// CreateCart creates a new Cart and adds it to the repository
 func (c *Service) CreateCart(
 	ctx context.Context,
 	input *CreateCartInput,
 ) (output *CreateCartOutput, err error) {
-	var id string
-	for {
-		id = uuid.New()
-
-		exists, err := c.repo.GetCart(id)
-		if err != nil {
-			return nil, err
-		}
-
-		if exists == nil {
-			break
-		}
+	cart, err := c.repo.NewCart(input.Owner)
+	if err != nil {
+		return nil, err
 	}
 
-	cart := NewCart(id, input.Owner)
-
-	if err = c.repo.SaveCart(cart); err != nil {
-		return
+	if err = c.repo.SaveCart(ctx, cart); err != nil {
+		return nil, err
 	}
 
 	output = new(CreateCartOutput)
@@ -131,20 +115,24 @@ func (c *Service) CreateCart(
 	return
 }
 
+// AddItem item to be added to a cart
 type AddItem struct {
 	ProductID string `json:"product_id"`
 	Qty       int    `json:"qty"`
 }
 
+// AddItemsInput parameters for calling AddItems
 type AddItemsInput struct {
 	CartID string    `json:"cart_id"`
 	Items  []AddItem `json:"items"`
 }
 
+// AddItemsOutput response data from calling AddItems
 type AddItemsOutput struct {
 	CartID string `json:"cart_id"`
 }
 
+// AddItems adds a list of items to a cart
 func (c *Service) AddItems(
 	ctx context.Context,
 	input *AddItemsInput,
@@ -174,7 +162,8 @@ func (c *Service) AddItems(
 		})
 	}
 
-	if err = c.repo.SaveCart(cart); err != nil {
+	cart = cart.Calculate()
+	if err = c.repo.SaveCart(ctx, cart); err != nil {
 		return
 	}
 
@@ -184,39 +173,116 @@ func (c *Service) AddItems(
 	return output, nil
 }
 
+// UpdateItem item to be set in the a cart
 type UpdateItem struct {
 	ProductID string `json:"product_id"`
 	Qty       int    `json:"qty"`
 }
 
+// UpdateItemsInput parameters for calling UpdateItems
 type UpdateItemsInput struct {
 	CartID string       `json:"cart_id"`
 	Items  []UpdateItem `json:"items"`
 }
 
+// UpdateItemsOutput response data from calling UpdateItems
 type UpdateItemsOutput struct {
 	CartID string `json:"cart_id"`
 }
 
-func (c *Service) UpdateItems(context.Context, *UpdateItemsInput) (*UpdateItemsOutput, error) {
-	return nil, nil
+// UpdateItems updates and overrides cart items
+func (c *Service) UpdateItems(
+	ctx context.Context,
+	input *UpdateItemsInput,
+) (output *UpdateItemsOutput, err error) {
+	var cart Cart
+	if cart, err = c.resolveCart(ctx, input.CartID); err != nil {
+		return nil, err
+	}
+
+	for _, updateItem := range input.Items {
+		productOutput, err := c.productService.GetProduct(
+			ctx,
+			&product.GetProductInput{
+				ProductID: updateItem.ProductID,
+			},
+		)
+
+		if err != nil {
+			return nil, err
+		}
+
+		cart = cart.UpdateItem(CartItem{
+			Qty:       updateItem.Qty,
+			ProductID: productOutput.Product.ID,
+			Name:      productOutput.Product.Name,
+			Price:     productOutput.Product.Price,
+		})
+	}
+
+	cart = cart.Calculate()
+	if err = c.repo.SaveCart(ctx, cart); err != nil {
+		return
+	}
+
+	output = new(UpdateItemsOutput)
+	output.CartID = cart.ID()
+
+	return output, nil
 }
 
+// RemoveItem item to be removed from the a cart
 type RemoveItem struct {
 	ProductID string `json:"product_id"`
 }
 
+// RemoveItemsInput parameters for calling RemoveItems
 type RemoveItemsInput struct {
 	CartID string       `json:"cart_id"`
 	Items  []RemoveItem `json:"items"`
 }
 
+// RemoveItemsOutput response data from calling RemoveItems
 type RemoveItemsOutput struct {
 	CartID string `json:"cart_id"`
 }
 
-func (c *Service) RemoveItems(context.Context, *RemoveItemsInput) (*RemoveItemsOutput, error) {
-	return nil, nil
+// RemoveItems removes items from a shopping cart.
+func (c *Service) RemoveItems(
+	ctx context.Context,
+	input *RemoveItemsInput,
+) (output *RemoveItemsOutput, err error) {
+	var cart Cart
+	if cart, err = c.resolveCart(ctx, input.CartID); err != nil {
+		return nil, err
+	}
+
+	for _, removeItem := range input.Items {
+		productOutput, err := c.productService.GetProduct(
+			ctx,
+			&product.GetProductInput{
+				ProductID: removeItem.ProductID,
+			},
+		)
+
+		if err != nil {
+			return nil, err
+		}
+
+		cart = cart.RemoveItem(CartItem{
+			ProductID: productOutput.Product.ID,
+		})
+	}
+
+	cart = cart.Calculate()
+	if err = c.repo.SaveCart(ctx, cart); err != nil {
+		return
+	}
+
+	output = new(RemoveItemsOutput)
+	output.CartID = cart.ID()
+
+	return output, nil
 }
 
 type AddCouponCodeInput struct {

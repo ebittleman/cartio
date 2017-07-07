@@ -16,10 +16,12 @@
 
 package product
 
+// GetProductInput parameters required for getting a product
 type GetProductInput struct {
 	ProductID string
 }
 
+// GetProductOutput GetProduct response data
 type GetProductOutput struct {
 	Product Product
 }

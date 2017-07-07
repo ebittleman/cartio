@@ -22,6 +22,7 @@ import (
 	"github.com/ebittleman/cartio/domain/product"
 )
 
+// ProductService service for interacting with products
 type ProductService interface {
 	GetProduct(context.Context, *product.GetProductInput) (*product.GetProductOutput, error)
 }

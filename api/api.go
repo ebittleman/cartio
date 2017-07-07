@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/ebittleman/cartio/domain/cart"
 	"github.com/ebittleman/cartio/domain/cart/iface"
 	"github.com/ebittleman/cartio/domain/product"
+	"github.com/ebittleman/cartio/events"
 	"github.com/pborman/uuid"
 )
 
@@ -95,7 +97,7 @@ func (c *CommandHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if subject != nil {
-		ctx = context.WithValue(r.Context(), cart.CartKey, subject)
+		ctx = context.WithValue(ctx, cart.CartKey, subject)
 	}
 
 	if ok, err := c.isAllowed(ctx, req.Command); err != nil {
@@ -165,7 +167,11 @@ func (c *CommandHandler) resolveSubject(
 		return nil, err
 	}
 
-	return *output.Cart, nil
+	if subject, ok := output.Cart.(events.Subject); ok {
+		subject.Subscribe(logEventListener)
+	}
+
+	return output.Cart, nil
 
 }
 
@@ -266,12 +272,12 @@ type Response struct {
 // ================================================
 //
 //		MOCK AREA BELOW, Just Some Placeholders
-//      to get this thing running.
+//		to get this thing running.
 //
 // ================================================
 //
 
-var carts = map[string]*cart.Cart{}
+var carts = map[string]cart.Cart{}
 
 // MockRepository fake cart repository
 type MockRepository struct {
@@ -279,23 +285,80 @@ type MockRepository struct {
 }
 
 // GetCart gets cart from global fixture
-func (m *MockRepository) GetCart(cartID string) (*cart.Cart, error) {
+func (m *MockRepository) GetCart(cartID string) (c cart.Cart, err error) {
 	m.RLock()
 	defer m.RUnlock()
-	cart, ok := carts[cartID]
-	if !ok {
-		return nil, nil
+
+	var ok bool
+	if c, ok = carts[cartID]; !ok {
+		err = cart.ErrCartNotFound
+	}
+
+	return
+}
+
+// NewCart finds a new id instantiates a cart and returns it
+func (m *MockRepository) NewCart(owner string) (cart.Cart, error) {
+	var id string
+	for {
+		id = uuid.New()
+
+		if _, err := m.GetCart(id); err == cart.ErrCartNotFound {
+			break
+		} else if err != nil {
+			return nil, err
+		}
+	}
+
+	cart := cart.NewObservableCart(id, owner)
+
+	if subject, ok := cart.(events.Subject); ok {
+		subject.Subscribe(logEventListener)
 	}
 
 	return cart, nil
 }
 
+var logEventListener = &struct{ events.Observer }{events.ObserverFunc(LogEvent)}
+
+// LogEvent an event observer that logs events with some contextual information
+// like the user and request id.
+func LogEvent(ctx context.Context, e events.Event) {
+	requestID := ctx.Value(requestKey)
+	userID := ctx.Value(userKey)
+	data, _ := json.Marshal(struct {
+		UserID    interface{}
+		RequestID interface{}
+		events.Event
+	}{
+		UserID:    userID,
+		RequestID: requestID,
+		Event:     e,
+	})
+	log.Println(string(data))
+}
+
 // SaveCart saves cart to global fixture
-func (m *MockRepository) SaveCart(cart cart.Cart) error {
+func (m *MockRepository) SaveCart(ctx context.Context, cart cart.Cart) error {
 	m.Lock()
 	defer m.Unlock()
-	carts[cart.ID()] = &cart
+	carts[cart.ID()] = cart
+
+	if subject, ok := cart.(events.Subject); ok {
+		subject.Notify(ctx)
+	}
+
 	return nil
+}
+
+var products = map[string]*product.GetProductOutput{
+	"prod1": &product.GetProductOutput{
+		Product: product.Product{
+			ID:    "prod1",
+			Name:  "Test Item",
+			Price: 100,
+		},
+	},
 }
 
 // MockProductService fake product service
@@ -312,14 +375,4 @@ func (m *MockProductService) GetProduct(
 	}
 
 	return output, nil
-}
-
-var products = map[string]*product.GetProductOutput{
-	"prod1": &product.GetProductOutput{
-		Product: product.Product{
-			ID:    "prod1",
-			Name:  "Test Item",
-			Price: 100,
-		},
-	},
 }

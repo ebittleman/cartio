@@ -16,6 +16,21 @@
 
 package cart
 
+import (
+	"errors"
+
+	"github.com/ebittleman/cartio/events"
+)
+
+var (
+	// ErrCartNotFound returned when a cart cannot be resolved
+	ErrCartNotFound = errors.New("cart Not Found")
+	// ErrInvalidParameters returned when a command cannot be executed due to
+	// invalid or missing parameters.
+	ErrInvalidParameters = errors.New("Invalid or Missing Parameters")
+)
+
+// Address describes the location of a building
 type Address struct {
 	Name        string
 	Addr1       string
@@ -26,14 +41,22 @@ type Address struct {
 	CountryCode string
 }
 
+// PayPal data that can be used to capture payment from PayPal
 type PayPal struct{}
+
+// Stripe data that can be used to capture payment from Stripe
 type Stripe struct{}
+
+// AccountBalance data that can be used to capture payment from a users account
+// balance then capture the remainder of an orders balance via the selected
+// payment gateway
 type AccountBalance struct {
 	RemainderWith string
 	PayPal        PayPal
 	Stripe        Stripe
 }
 
+// PaymentMethod method for capturing payment
 type PaymentMethod struct {
 	Type           string
 	PayPal         PayPal
@@ -41,6 +64,7 @@ type PaymentMethod struct {
 	AccountBalance AccountBalance
 }
 
+// CartItem a line item in a cart
 type CartItem struct {
 	Qty       int
 	ProductID string
@@ -48,7 +72,17 @@ type CartItem struct {
 	Price     int
 }
 
-type Cart struct {
+// Cart domain model interface for interacting with a shopping cart
+type Cart interface {
+	ID() string
+	Owner() string
+	Calculate() Cart
+	AddItem(item CartItem) Cart
+	UpdateItem(item CartItem) Cart
+	RemoveItem(item CartItem) Cart
+}
+
+type cart struct {
 	id    string
 	owner string
 
@@ -69,22 +103,23 @@ type Cart struct {
 	Total    int
 }
 
-func NewCart(id string, owner string) Cart {
-	return Cart{
+// NewCart instantiates a new simple cart
+func NewCart(id string, owner string) cart {
+	return cart{
 		id:    id,
 		owner: owner,
 	}
 }
 
-func (c Cart) ID() string {
+func (c cart) ID() string {
 	return c.id
 }
 
-func (c Cart) Owner() string {
+func (c cart) Owner() string {
 	return c.owner
 }
 
-func (c Cart) Calculate() Cart {
+func (c cart) Calculate() Cart {
 	var (
 		subTotal int
 		total    int
@@ -102,7 +137,7 @@ func (c Cart) Calculate() Cart {
 	return c
 }
 
-func (c Cart) AddItem(item CartItem) Cart {
+func (c cart) AddItem(item CartItem) Cart {
 	for i, cursor := range c.Items {
 		if cursor.ProductID == item.ProductID {
 			c.Items[i].Qty += item.Qty
@@ -117,7 +152,7 @@ func (c Cart) AddItem(item CartItem) Cart {
 	return c
 }
 
-func (c Cart) UpdateItem(item CartItem) Cart {
+func (c cart) UpdateItem(item CartItem) Cart {
 	for i, cursor := range c.Items {
 		if cursor.ProductID == item.ProductID {
 			c.Items[i] = item
@@ -131,7 +166,7 @@ func (c Cart) UpdateItem(item CartItem) Cart {
 	return c
 }
 
-func (c Cart) RemoveItem(item CartItem) Cart {
+func (c cart) RemoveItem(item CartItem) Cart {
 	for i, cursor := range c.Items {
 		if cursor.ProductID == item.ProductID {
 			c.Items = append(c.Items[:i], c.Items[i+1:]...)
@@ -140,4 +175,102 @@ func (c Cart) RemoveItem(item CartItem) Cart {
 	}
 
 	return c
+}
+
+type observableCart struct {
+	cart
+	*events.Evented
+}
+
+// NewObservableCart a shopping cart that implements the events.Subject
+// interface which emits events after interacting with the cart
+func NewObservableCart(id string, owner string) Cart {
+	cart := observableCart{
+		cart: cart{
+			id:    id,
+			owner: owner,
+		},
+		Evented: &events.Evented{},
+	}
+
+	cart.Emit(events.Event{
+		Name:     "new-cart",
+		EntityID: id,
+		Payload: struct {
+			ID    string
+			Owner string
+		}{
+			ID:    id,
+			Owner: owner,
+		},
+	})
+
+	return cart
+}
+
+func (o observableCart) AddItem(item CartItem) Cart {
+	o.cart = o.cart.AddItem(item).(cart)
+	o.Emit(events.Event{
+		Name:     "item-added",
+		EntityID: o.ID(),
+		Payload: struct {
+			CartItem
+		}{
+			CartItem: item,
+		},
+	})
+
+	return o
+}
+
+func (o observableCart) UpdateItem(item CartItem) Cart {
+	o.cart = o.cart.UpdateItem(item).(cart)
+	o.Emit(events.Event{
+		Name:     "item-updated",
+		EntityID: o.ID(),
+		Payload: struct {
+			CartItem
+		}{
+			CartItem: item,
+		},
+	})
+
+	return o
+}
+
+func (o observableCart) RemoveItem(item CartItem) Cart {
+	o.cart = o.cart.RemoveItem(item).(cart)
+	o.Emit(events.Event{
+		Name:     "item-removed",
+		EntityID: o.ID(),
+		Payload: struct {
+			ProductID string
+		}{
+			ProductID: item.ProductID,
+		},
+	})
+
+	return o
+}
+
+func (o observableCart) Calculate() Cart {
+	o.cart = o.cart.Calculate().(cart)
+
+	o.Emit(events.Event{
+		Name:     "calculated",
+		EntityID: o.ID(),
+		Payload: struct {
+			SubTotal int
+			SalesTax int
+			Shipping int
+			Total    int
+		}{
+			SubTotal: o.SubTotal,
+			SalesTax: o.SalesTax,
+			Shipping: o.Shipping,
+			Total:    o.Total,
+		},
+	})
+
+	return o
 }
