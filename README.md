@@ -1,6 +1,7 @@
 # CARTIO
+[![GoDoc](https://godoc.org/github.com/ebittleman/cartio?status.svg)](https://godoc.org/github.com/ebittleman/cartio)
 
-A e-commerce API.
+An e-commerce API.
 
 ## API
 

@@ -1,4 +1,4 @@
-// cartio - A e-commerce api.
+// cartio - An e-commerce API.
 // Copyright (C) 2017 Eric Bittleman
 
 // This program is free software: you can redistribute it and/or modify
